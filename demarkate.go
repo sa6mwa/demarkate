@@ -31,6 +31,7 @@ import (
 
   "golang.org/x/net/http2"
   "golang.org/x/net/http2/h2c"
+  "golang.org/x/net/netutil"
   log "github.com/sirupsen/logrus"
   "github.com/kelseyhightower/envconfig"
   "github.com/sa6mwa/demarkate/pemloader"
@@ -39,6 +40,8 @@ import (
 // version gets replaced by -ldflags "-X github.com/sa6mwa/demarkate.version=..." in Makefile
 var version = "v0.0"
 
+// envconfig prefix
+var EnvconfigPrefix = "DEMARKATE"
 
 
 // This is a fake io.Writer for use with log.Logger to logrus. Inspired by
@@ -58,6 +61,8 @@ func (m *logrusWriter) Write(p []byte) (n int, err error) {
 // Stores a go standard Logger using the logrusWriter wrapper
 var logWrapper *golog.Logger
 
+// Used to access a net.Dialer with Timeout set to DEMARKATE_BACKEND_TIMEOUT * time.Second
+var netDialer net.Dialer
 
 func init() {
   // log.Logger for http ErrorLog using io.Writer wrapper to use logrus instead
@@ -107,8 +112,14 @@ func (h *hook) Fire(e *log.Entry) error {
 type Config struct {
   Protocol string `envconfig:"PROTOCOL"`
   ListenTo string `envconfig:"LISTEN_TO"`
+  MaxConns int `envconfig:"MAX_CONNS"`
+  ReadHeaderTimeout time.Duration `envconfig:"READHEADERTIMEOUT"`
+  ReadTimeout time.Duration `envconfig:"READTIMEOUT"`
+  WriteTimeout time.Duration `envconfig:"WRITETIMEOUT"`
+  IdleTimeout time.Duration `envconfig:"IDLETIMEOUT"`
   Backend string `envconfig:"BACKEND"`
   BackendType string `envconfig:"BACKEND_TYPE"`
+  BackendTimeout time.Duration `envconfig:"BACKEND_TIMEOUT"`
   CertFiles []string `envconfig:"CERT_FILES"`
   SelfSign bool `envconfig:"SELF_SIGN"`
   Organization string `envconfig:"SELF_SIGN_ORG"`
@@ -123,8 +134,14 @@ func New(opts ...Option) Config {
   cnf := Config{
     Protocol: "tcp",
     ListenTo: ":8080",
+    MaxConns: 500,
+    ReadHeaderTimeout: 30 * time.Second,
+    ReadTimeout: 30 * time.Second,
+    WriteTimeout: 30 * time.Second,
+    IdleTimeout: 60 * time.Second,
     Backend: "",
     BackendType: "h2c",
+    BackendTimeout: 5 * time.Second,
     CertFiles: []string{},
     SelfSign: false,
     Organization: "Globex Corporation",
@@ -156,6 +173,11 @@ func OnlyTCP6() Option {
 func ListenTo(socket_address string) Option {
   return func(cnf *Config) {
     cnf.ListenTo = socket_address
+  }
+}
+func MaxConns(conns int) Option {
+  return func(cnf *Config) {
+    cnf.MaxConns = conns
   }
 }
 func Backend(backend string) Option {
@@ -190,7 +212,7 @@ func CommonName(cn string) Option {
 }
 func EnvConfig() Option {
   return func(cnf *Config) {
-    err := envconfig.Process("demarkate", cnf)
+    err := envconfig.Process(EnvconfigPrefix, cnf)
     if err != nil {
       log.Fatal(err.Error())
     }
@@ -221,8 +243,6 @@ func Panic(format string, v ...interface{}) {
 }
 
 
-
-
 // Used to store the signature of which NewSingleHostReverseProxy function to
 // use depending on the value of DEMARKATE_BACKEND_TYPE.
 type SingleHostReverseProxyFunc func(*url.URL)(*httputil.ReverseProxy)
@@ -247,7 +267,7 @@ func NewSingleHostH2cReverseProxy(target *url.URL) (*httputil.ReverseProxy) {
   target.Scheme = "https"
   // we ignore tls.Config in our custom dialer to always make clear-text connections
   dial := func(network, addr string, cfg *tls.Config) (net.Conn, error) {
-    return net.DialTimeout(network, addr, 3 * time.Second)
+    return netDialer.Dial(network, addr)
   }
   transport := &http2.Transport{
     // AllowHTTP true is not the same as bypassing DialTLS with a cleartext TCP
@@ -322,9 +342,21 @@ consumed by e.g fluentd).
 
   DEMARKATE_PROTOCOL      net.Listen protocol, e.g: "tcp" (default), "tcp4"
   DEMARKATE_LISTEN_TO     net.Listen address, e.g: ":8080"
+  DEMARKATE_MAX_CONNS     Maximum number of simultaneous connections to the
+                          listener (proxy frontend), default is 500
+  DEMARKATE_READHEADERTIMEOUT
+  DEMARKATE_READTIMEOUT
+  DEMARKATE_WRITETIMEOUT
+  DEMARKATE_IDLETIMEOUT
+                          http.Server{} timeouts. Some strict defaults are
+                          provided, but you have the possibility to customize
+                          the proxy frontend server timeouts using these
+                          variables
   DEMARKATE_BACKEND       URL of backend endpoint, e.g: "http://mysvc:12345"
   DEMARKATE_BACKEND_TYPE  Choose single reverse proxy client type:
                           "h2c" (default), "http2", or "http" (for 2 and 1.1)
+  DEMARKATE_BACKEND_TIMEOUT
+                          net.Dial timeout to the backend, default is 5 seconds
   DEMARKATE_CERT_FILES    Comma separated list of PEM, CRT or KEY files. It will
                           try to load both certificate and private key from
                           each file (you can combine cert and key into a single
@@ -342,6 +374,8 @@ consumed by e.g fluentd).
 `
   fmt.Printf(usageMsg, os.Args[0])
 }
+
+
 
 func Start(cnf *Config) error {
   var shrpf SingleHostReverseProxyFunc
@@ -390,18 +424,27 @@ func Start(cnf *Config) error {
   }
 
   startlog := log.WithFields(log.Fields{
-      "DEMARKATE_PROTOCOL": cnf.Protocol,
-      "DEMARKATE_LISTEN_TO": cnf.ListenTo,
-      "DEMARKATE_BACKEND": cnf.Backend,
-      "DEMARKATE_BACKEND_TYPE": cnf.BackendType,
-      "DEMARKATE_CERT_FILES": cnf.CertFiles,
-      "DEMARKATE_SELF_SIGN": cnf.SelfSign,
-      "DEMARKATE_SELF_SIGN_ORG": cnf.Organization,
-      "DEMARKATE_SELF_SIGN_CN": cnf.CommonName,
-      "DEMARKATE_LOG": cnf.Log,
+      EnvconfigPrefix + "_PROTOCOL": cnf.Protocol,
+      EnvconfigPrefix + "_LISTEN_TO": cnf.ListenTo,
+      EnvconfigPrefix + "_MAX_CONNS": cnf.MaxConns,
+      EnvconfigPrefix + "_READHEADERTIMEOUT": cnf.ReadHeaderTimeout.String(),
+      EnvconfigPrefix + "_READTIMEOUT": cnf.ReadTimeout.String(),
+      EnvconfigPrefix + "_WRITETIMEOUT": cnf.WriteTimeout.String(),
+      EnvconfigPrefix + "_IDLETIMEOUT": cnf.IdleTimeout.String(),
+      EnvconfigPrefix + "_BACKEND": cnf.Backend,
+      EnvconfigPrefix + "_BACKEND_TYPE": cnf.BackendType,
+      EnvconfigPrefix + "_BACKEND_TIMEOUT": cnf.BackendTimeout.String(),
+      EnvconfigPrefix + "_CERT_FILES": cnf.CertFiles,
+      EnvconfigPrefix + "_SELF_SIGN": cnf.SelfSign,
+      EnvconfigPrefix + "_SELF_SIGN_ORG": cnf.Organization,
+      EnvconfigPrefix + "_SELF_SIGN_CN": cnf.CommonName,
+      EnvconfigPrefix + "_LOG": cnf.Log,
       "version": version,
   })
   startlog.Info("Initializing demarkate")
+
+  // Create a net.Dialer with Timeout set to DEMARKATE_BACKEND_TIMEOUT
+  netDialer = net.Dialer{ Timeout: cnf.BackendTimeout }
 
   proxy := shrpf(backend_url)
 
@@ -440,9 +483,10 @@ func Start(cnf *Config) error {
   })
 
   srv := &http.Server{
-    ReadTimeout: 30 * time.Second,
-    WriteTimeout: 5 * time.Minute,
-    IdleTimeout: 10 * time.Second,
+    ReadHeaderTimeout: cnf.ReadHeaderTimeout,
+    ReadTimeout: cnf.ReadTimeout,
+    WriteTimeout: cnf.WriteTimeout,
+    IdleTimeout: cnf.IdleTimeout,
     TLSConfig: tlsConfig,
     Handler: handler,
     ErrorLog: logWrapper,
@@ -455,6 +499,10 @@ func Start(cnf *Config) error {
     log.Error(err.Error())
     return err
   }
+  defer lis.Close()
+
+  // Limit simultaneous connections to DEMARKATE_MAX_CONNS
+  lis = netutil.LimitListener(lis, cnf.MaxConns)
 
   var cert *tls.Certificate
   if len(cnf.CertFiles) < 1 {
