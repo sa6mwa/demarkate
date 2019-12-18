@@ -27,6 +27,7 @@ import (
   "os"
   "io"
   "strings"
+  "bytes"
   golog "log"
 
   "golang.org/x/net/http2"
@@ -34,7 +35,9 @@ import (
   "golang.org/x/net/netutil"
   log "github.com/sirupsen/logrus"
   "github.com/kelseyhightower/envconfig"
+  "github.com/gobwas/glob"
   "github.com/sa6mwa/demarkate/pemloader"
+  "github.com/sa6mwa/demarkate/custom"
 )
 
 // version gets replaced by -ldflags "-X github.com/sa6mwa/demarkate.version=..." in Makefile
@@ -61,9 +64,6 @@ func (m *logrusWriter) Write(p []byte) (n int, err error) {
 // Stores a go standard Logger using the logrusWriter wrapper
 var logWrapper *golog.Logger
 
-// Used to access a net.Dialer with Timeout set to DEMARKATE_BACKEND_TIMEOUT * time.Second
-var netDialer net.Dialer
-
 func init() {
   // log.Logger for http ErrorLog using io.Writer wrapper to use logrus instead
   logWrapper = golog.New(&logrusWriter{}, "", golog.LstdFlags)
@@ -79,7 +79,7 @@ func init() {
   log.SetLevel(log.InfoLevel)
   log.AddHook(&hook{})
 }
-/* https://stackoverflow.com/a/40502637 */
+// https://stackoverflow.com/a/40502637
 type UTCFormatter struct {
     log.Formatter
 }
@@ -94,30 +94,36 @@ func (h *hook) Levels() []log.Level {
 func (h *hook) Fire(e *log.Entry) error {
   // omit keys with empty values
   for k, v := range e.Data {
-    if s, ok := v.(string); ok {
-      if s == "" {
-        delete(e.Data, k)
-        continue
-      }
+    switch r := v.(type) {
+      case string:
+        if r == "" {
+          delete(e.Data, k)
+          continue
+        }
+      case []string:
+        if len(r) == 0 {
+          delete(e.Data, k)
+        }
     }
   }
   return nil
 }
 
 
-
-/* New() Config struct, envconfig prefix is DEMARKATE_, e.g
- * DEMARKATE_LISTEN_TO=":1337" DEMARKATE_SELF_SIGN="true"
- */
+// New() Config struct, envconfig prefix is DEMARKATE_, e.g
+// DEMARKATE_LISTEN_TO=":1337" DEMARKATE_SELF_SIGN="true"
 type Config struct {
   Protocol string `envconfig:"PROTOCOL"`
-  ListenTo string `envconfig:"LISTEN_TO"`
+  ListenTo []string `envconfig:"LISTEN_TO"`
   MaxConns int `envconfig:"MAX_CONNS"`
+  MaxIdleConns int `envconfig:"MAX_IDLE_CONNS"`
+  Timeout time.Duration `envconfig:"TIMEOUT"`
   ReadHeaderTimeout time.Duration `envconfig:"READHEADERTIMEOUT"`
   ReadTimeout time.Duration `envconfig:"READTIMEOUT"`
   WriteTimeout time.Duration `envconfig:"WRITETIMEOUT"`
   IdleTimeout time.Duration `envconfig:"IDLETIMEOUT"`
   Backend string `envconfig:"BACKEND"`
+  Backends []string `envconfig:"BACKENDS"`
   BackendType string `envconfig:"BACKEND_TYPE"`
   BackendTimeout time.Duration `envconfig:"BACKEND_TIMEOUT"`
   CertFiles []string `envconfig:"CERT_FILES"`
@@ -126,20 +132,33 @@ type Config struct {
   CommonName string `envconfig:"SELF_SIGN_CN"`
   Log bool `envconfig:"LOG"`
   UsageOnSyntaxError bool `envconfig:"USAGE"`
+  BackendStructs []BackendStruct `ignored:"true"`
+  URL *url.URL `ignored:"true"`
 }
+type BackendStruct struct {
+  Filter string
+  Target string
+  URL *url.URL
+  HostGlob glob.Glob
+  Path string
+}
+
 
 type Option func(cnf *Config)
 
 func New(opts ...Option) Config {
-  cnf := Config{
+  cnf := &Config{
     Protocol: "tcp",
-    ListenTo: ":8080",
+    ListenTo: []string{},
     MaxConns: 500,
+    MaxIdleConns: 100,
+    Timeout: 5 * time.Minute,
     ReadHeaderTimeout: 30 * time.Second,
     ReadTimeout: 30 * time.Second,
     WriteTimeout: 30 * time.Second,
     IdleTimeout: 60 * time.Second,
     Backend: "",
+    Backends: []string{},
     BackendType: "h2c",
     BackendTimeout: 5 * time.Second,
     CertFiles: []string{},
@@ -150,13 +169,33 @@ func New(opts ...Option) Config {
     UsageOnSyntaxError: true,
   }
   for _, opt := range opts {
-    opt(&cnf)
+    opt(cnf)
   }
   if ! cnf.SelfSign {
     cnf.Organization = ""
     cnf.CommonName = ""
   }
-  return cnf
+  for _, b := range cnf.Backends {
+    backendPair := strings.SplitN(b, "=", 2)
+    if len(backendPair) == 2 {
+      backend_url, err := url.Parse(backendPair[1])
+      if err == nil {
+        cnf.BackendStructs = append(cnf.BackendStructs, BackendStruct{
+          Filter: backendPair[0],
+          Target: backendPair[1],
+          URL: backend_url,
+        })
+      } else {
+        log.Error("unable to url.Parse %s", backendPair[1])
+      }
+    }
+  }
+  // We only support binding two ports, first is potentially http2 with tls,
+  // second is always h2c or http1 with h2c upgrade (unencrypted)
+  if len(cnf.ListenTo) > 2 {
+    cnf.ListenTo = cnf.ListenTo[:2]
+  }
+  return *cnf
 }
 
 
@@ -172,12 +211,17 @@ func OnlyTCP6() Option {
 }
 func ListenTo(socket_address string) Option {
   return func(cnf *Config) {
-    cnf.ListenTo = socket_address
+    cnf.ListenTo = append(cnf.ListenTo, socket_address)
   }
 }
 func MaxConns(conns int) Option {
   return func(cnf *Config) {
     cnf.MaxConns = conns
+  }
+}
+func Timeout(timeout time.Duration) Option {
+  return func(cnf *Config) {
+    cnf.Timeout = timeout
   }
 }
 func Backend(backend string) Option {
@@ -226,8 +270,20 @@ func UsageOnSyntaxError(v bool) Option {
 
 
 /* wrapped logging functions for convenience, e.g: demarkate.Info("hello world") */
+func Info(format string, v ...interface{}) {
+  log.Info(fmt.Sprintf(format, v...))
+}
 func Printf(format string, v ...interface{}) {
   log.Info(fmt.Sprintf(format, v...))
+}
+func Warn(format string, v ...interface{}) {
+  log.Warn(fmt.Sprintf(format, v...))
+}
+func Warning(format string, v ...interface{}) {
+  log.Warn(fmt.Sprintf(format, v...))
+}
+func Error(format string, v ...interface{}) {
+  log.Error(fmt.Sprintf(format, v...))
 }
 func Errorf(format string, v ...interface{}) {
   log.Error(fmt.Sprintf(format, v...))
@@ -245,71 +301,222 @@ func Panic(format string, v ...interface{}) {
 
 // Used to store the signature of which NewSingleHostReverseProxy function to
 // use depending on the value of DEMARKATE_BACKEND_TYPE.
-type SingleHostReverseProxyFunc func(*url.URL)(*httputil.ReverseProxy)
+//type SingleHostReverseProxyFunc func(*url.URL)(*httputil.ReverseProxy)
 
-// H2c (cleartext http2) ReverseProxy
-func NewSingleHostH2cReverseProxy(target *url.URL) (*httputil.ReverseProxy) {
-  // We need to add the port of some common services since we force change
-  // scheme to https further below
-  if ! strings.Contains(target.Host, ":") {
-    switch strings.ToLower(target.Scheme) {
-      case "http":
-        target.Host = target.Host + ":80"
-      case "https":
-        target.Host = target.Host + ":443"
-      case "http-alt":
-        target.Host = target.Host + ":8080"
-      case "gopher":
-        target.Host = target.Host + ":70"
+
+func isOneOf(s string, mustBeOneOf... string) error {
+  // string s must be one of mustBeOneOf
+  for _, k := range mustBeOneOf {
+    if s == k {
+      return nil
     }
   }
-  // Enforce https to use DialTLS transport for clear-text http2.
-  target.Scheme = "https"
-  // we ignore tls.Config in our custom dialer to always make clear-text connections
-  dial := func(network, addr string, cfg *tls.Config) (net.Conn, error) {
-    return netDialer.Dial(network, addr)
+  return fmt.Errorf("%s does not contain %v", s, mustBeOneOf)
+}
+
+
+// from github.com/golang/go/src/net/http/httputil/reverseproxy.go
+func singleJoiningSlash(a, b string) string {
+	aslash := strings.HasSuffix(a, "/")
+	bslash := strings.HasPrefix(b, "/")
+	switch {
+	case aslash && bslash:
+		return a + b[1:]
+	case !aslash && !bslash:
+		return a + "/" + b
+	}
+	return a + b
+}
+
+func removeDupSlashes(s string) string {
+  var buf bytes.Buffer
+  var last rune
+  for i, r := range s {
+    if r != '/' || r != last || i == 0 {
+      buf.WriteRune(r)
+      last = r
+    }
   }
-  transport := &http2.Transport{
-    // AllowHTTP true is not the same as bypassing DialTLS with a cleartext TCP
-    // dialer (commented out)...
-    // AllowHTTP: true,
-    DialTLS: dial,
+  return buf.String()
+}
+
+func NewReverseProxy(cnf *Config) (*httputil.ReverseProxy) {
+  var director func(*http.Request)
+  backendType := strings.ToLower(cnf.BackendType)
+  // make sure we know the backend type
+  err := isOneOf(backendType, "h2c", "http2c", "http2", "http", "http1", "http11", "http1.1")
+  if err != nil {
+    return nil
   }
-  proxy := httputil.NewSingleHostReverseProxy(target)
-  // Replace the transport with x/net/http2
-  proxy.Transport = transport
-  // Use our io.Writer log wrapper
-  proxy.ErrorLog = logWrapper
+  // iterate over backend_type and change what's necessary
+  switch backendType {
+    case "h2c", "http2c":
+      // prep h2c endpoints
+      for i := range cnf.BackendStructs {
+        if ! strings.Contains(cnf.BackendStructs[i].URL.Host, ":") {
+          switch strings.ToLower(cnf.BackendStructs[i].URL.Scheme) {
+            case "http":
+              cnf.BackendStructs[i].URL.Host = cnf.BackendStructs[i].URL.Host + ":80"
+            case "https":
+              cnf.BackendStructs[i].URL.Host = cnf.BackendStructs[i].URL.Host + ":443"
+            case "http-alt":
+              cnf.BackendStructs[i].URL.Host = cnf.BackendStructs[i].URL.Host + ":8080"
+            case "gopher":
+              cnf.BackendStructs[i].URL.Host = cnf.BackendStructs[i].URL.Host + ":70"
+          }
+        }
+        // Enforce https to use DialTLS transport for clear-text http2.
+        cnf.BackendStructs[i].URL.Scheme = "https"
+      }
+  }
+
+  if len(cnf.BackendStructs) == 1 && cnf.BackendStructs[0].Filter == "/" {
+    log.Infof("Single backend configured, setting up single host reverse proxy for %s", cnf.BackendStructs[0].Target)
+    // setup a director similar to httputil.NewSingleHostReverseProxy
+    b := cnf.BackendStructs[0]
+    director = func(req *http.Request) {
+      req.URL.Scheme = b.URL.Scheme
+      req.URL.Host = b.URL.Host
+      origURLpath := req.URL.Path
+      req.URL.Path = singleJoiningSlash(b.URL.Path, req.URL.Path)
+      if b.URL.RawQuery == "" || req.URL.RawQuery == "" {
+        req.URL.RawQuery = b.URL.RawQuery + req.URL.RawQuery
+      } else {
+        req.URL.RawQuery = b.URL.RawQuery + "&" + req.URL.RawQuery
+      }
+      if _, ok := req.Header["User-Agent"]; !ok {
+        // explicitly disable User-Agent so it's not set to default value
+        req.Header.Set("User-Agent", "")
+      }
+      log.WithFields(log.Fields{
+        "request_uri": req.RequestURI,
+        "host": req.Host,
+        "remote_addr": req.RemoteAddr,
+        "method": req.Method,
+        "protocol": req.Proto,
+        "close": req.Close,
+        "receiver": req.URL.Scheme + "://" + req.URL.Host + req.URL.Path,
+        "filter": b.Filter,
+        "backend": b.Target,
+        "user-agent": req.Header.Get("User-Agent"),
+      }).Infof("%s%s DE %s QSO %s://%s%s", req.Host, origURLpath, req.RemoteAddr, req.URL.Scheme, req.URL.Host, req.URL.Path)
+    }
+  } else {
+    // else it's a multi-host, multi-path director
+    for i := range cnf.BackendStructs {
+      // compile host glob and path (path can not be a glob unfortunately)
+      host := "*"
+      path := ""
+      if len(cnf.BackendStructs[i].Filter) > 0 {
+        if cnf.BackendStructs[i].Filter[0] == '/' {
+          // interpret as a path from any host
+          path = "/" + strings.TrimLeft(removeDupSlashes(cnf.BackendStructs[i].Filter), "/")
+        } else {
+          // interpret as a host/path match or possible only host
+          s := strings.SplitN(cnf.BackendStructs[i].Filter, "/", 2)
+          host = s[0]
+          if len(s) > 1 {
+            path = "/" + strings.TrimLeft(removeDupSlashes(s[1]), "/")
+          }
+        }
+      }
+      cnf.BackendStructs[i].HostGlob = glob.MustCompile(host)
+      cnf.BackendStructs[i].Path = path
+    }
+    // multihost, multipath director
+    director = func(req *http.Request) {
+      reqHost := strings.SplitN(req.Host, ":", 2)[0]
+      for _, b := range cnf.BackendStructs {
+        if b.HostGlob.Match(reqHost) && strings.HasPrefix(req.URL.Path, b.Path) {
+          req.URL.Scheme = b.URL.Scheme
+          req.URL.Host = b.URL.Host
+          origURLpath := req.URL.Path
+          pathRemainder := strings.TrimLeft(req.URL.Path, b.Path)
+          if pathRemainder == "" {
+            req.URL.Path = b.URL.Path
+          } else {
+            req.URL.Path = singleJoiningSlash(b.URL.Path, pathRemainder)
+          }
+          log.Info("new req.URL.Path: " + req.URL.Path)
+          if b.URL.RawQuery == "" || req.URL.RawQuery == "" {
+            req.URL.RawQuery = b.URL.RawQuery + req.URL.RawQuery
+          } else {
+            req.URL.RawQuery = b.URL.RawQuery + "&" + req.URL.RawQuery
+          }
+          if _, ok := req.Header["User-Agent"]; !ok {
+            // explicitly disable User-Agent so it's not set to default value
+            req.Header.Set("User-Agent", "")
+          }
+          log.WithFields(log.Fields{
+            "request_uri": req.RequestURI,
+            "host": req.Host,
+            "remote_addr": req.RemoteAddr,
+            "method": req.Method,
+            "protocol": req.Proto,
+            "close": req.Close,
+            "receiver": req.URL.Scheme + "://" + req.URL.Host + req.URL.Path,
+            "filter": b.Filter,
+            "backend": b.Target,
+            "user-agent": req.Header.Get("User-Agent"),
+          }).Infof("%s%s DE %s QSO %s://%s%s", req.Host, origURLpath, req.RemoteAddr, req.URL.Scheme, req.URL.Host, req.URL.Path)
+          return
+        }
+      }
+      log.Error("request did not match a backend filter!")
+    }
+  }
+
+  // director has been set up, get a ReverseProxy with our director and
+  // io.Writer log wrapper
+  proxy := &httputil.ReverseProxy{ Director: director, ErrorLog: logWrapper }
+
+  // add type specific dialers and transports
+  switch strings.ToLower(backendType) {
+    case "h2c", "http2c":
+      // H2c (cleartext http2) ReverseProxy
+      // we ignore tls.Config in our custom dialer to always make clear-text connections
+      dial := func(network, addr string, cfg *tls.Config) (net.Conn, error) {
+        d := net.Dialer{ Timeout: cnf.BackendTimeout }
+        return d.Dial(network, addr)
+      }
+      transport := &http2.Transport{
+        // AllowHTTP true is not the same as bypassing DialTLS with a cleartext TCP
+        // dialer (commented out)...
+        // AllowHTTP: true,
+        DialTLS: dial,
+      }
+      proxy.Transport = transport
+    case "http2":
+      // HTTP/2 TLS ReverseProxy, uses http2.Transport instead of
+      // http.Transport (you will probably want "http" below for http2 in most
+      // cases)
+      tlscc := &tls.Config{
+        InsecureSkipVerify: true,
+      }
+      transport := &http2.Transport{
+        TLSClientConfig: tlscc,
+      }
+      proxy.Transport = transport
+    case "http", "http1", "http11", "http1.1":
+      // HTTP/1.1 and HTTP/2 ReverseProxy
+      tlscc := &tls.Config{
+        InsecureSkipVerify: true,
+      }
+      transport := &http.Transport{
+        TLSClientConfig: tlscc,
+        TLSHandshakeTimeout: cnf.BackendTimeout,
+        MaxIdleConns: cnf.MaxIdleConns,
+        IdleConnTimeout: cnf.IdleTimeout,
+        ExpectContinueTimeout: 1 * time.Second,
+        DialContext: (&net.Dialer{ Timeout: cnf.BackendTimeout, KeepAlive: 30 * time.Second, DualStack: true }).DialContext,
+      }
+      proxy.Transport = transport
+    default:
+      log.Fatalf("backend type %s not supported", backendType)
+  }
   return proxy
 }
 
-// HTTP/2 (TLS) ReverseProxy
-func NewSingleHostH2ReverseProxy(target *url.URL) (*httputil.ReverseProxy) {
-  tlscc := &tls.Config{
-    InsecureSkipVerify: true,
-  }
-  transport := &http2.Transport{
-    TLSClientConfig: tlscc,
-  }
-  proxy := httputil.NewSingleHostReverseProxy(target)
-  proxy.Transport = transport
-  proxy.ErrorLog = logWrapper
-  return proxy
-}
-
-// HTTP/1.1 and HTTP/2 ReverseProxy
-func NewSingleHostHTTPReverseProxy(target *url.URL) (*httputil.ReverseProxy) {
-  tlscc := &tls.Config{
-    InsecureSkipVerify: true,
-  }
-  transport := &http.Transport{
-    TLSClientConfig: tlscc,
-  }
-  proxy := httputil.NewSingleHostReverseProxy(target)
-  proxy.Transport = transport
-  proxy.ErrorLog = logWrapper
-  return proxy
-}
 
 
 func Usage() {
@@ -341,9 +548,17 @@ It runs in the foreground and prints json-formatted logs to stdout (to be
 consumed by e.g fluentd).
 
   DEMARKATE_PROTOCOL      net.Listen protocol, e.g: "tcp" (default), "tcp4"
-  DEMARKATE_LISTEN_TO     net.Listen address, e.g: ":8080"
+  DEMARKATE_LISTEN_TO     net.Listen address, e.g: ":8080". This can be 2
+                          listeners separated by comma (,). The 2nd listener
+                          always serves an unencrypted (with h2c upgrade) proxy
+                          while the 1st listener uses TLS if you choose to.
+                          Example: ":8443,:8080"
   DEMARKATE_MAX_CONNS     Maximum number of simultaneous connections to the
-                          listener (proxy frontend), default is 500
+                          listener (proxy frontend), default is 500.
+  DEMARKATE_MAX_IDLE_CONNS
+                          Maximum number of idle connections.
+  DEMARKATE_TIMEOUT       Handler timeout of each request, sets the timeout of
+                          http.TimeoutHandler. Default 5 minutes.
   DEMARKATE_READHEADERTIMEOUT
   DEMARKATE_READTIMEOUT
   DEMARKATE_WRITETIMEOUT
@@ -352,12 +567,43 @@ consumed by e.g fluentd).
                           provided, but you have the possibility to customize
                           the proxy frontend server timeouts using these
                           variables
-  DEMARKATE_BACKEND       URL of backend endpoint, e.g: "http://mysvc:12345"
+  DEMARKATE_BACKEND       URL of backend endpoint, e.g: "http://mysvc:12345".
+                          Preserved for backwards compatibility.
+  DEMARKATE_BACKENDS      Multihost, multipath reverse proxy. Key=value pairs
+                          of host/path (filter) and destination backend URL as
+                          a list where rules are separated by comma (,).  The
+                          list is processed top down and when a filter matches
+                          (both host and path, unless host is empty) it directs
+                          the proxy towards the associated upstream.  Filter
+                          can be host/path/subpath or simply "hostname.tld".
+                          The hostname part can contain globs (not the path
+                          part), for example, "*company.*" which will match
+                          anycompany.anydomain.
+                          Examples:
+                          "*altsite.com=http://alt.net:8080,/=http://default"
+                          If host header in request ends with altsite.com all
+                          requests (as path is empty or /) will go towards
+                          http://alt.net:8080. If the host header does not
+                          match it continues to the single slash filter, which
+                          will match anything, thus the default site.
+                          Example: all /status requests to the same backend,
+                          but if host starts with "api." and has path /special,
+                          direct it to a special api backend, otherwise direct
+                          all other api requests to the api backend on port
+                          8080, unless host starts with www, request should go
+                          to the web host on port 8081:
+                          "/status=http://status:1234,api.*/special=http://sapi,
+                          api.*=http://api:8080,www.*=http://web:8081"
+                          If there is no match, proxy will return 502 Bad
+                          Gateway.
   DEMARKATE_BACKEND_TYPE  Choose single reverse proxy client type:
-                          "h2c" (default), "http2", or "http" (for 2 and 1.1)
+                          "h2c" (default), "http2", or "http" (for 2 and 1.1).
+                          Currently, this configures all backends to be of the
+                          same type, there is no multi-type support yet.
   DEMARKATE_BACKEND_TIMEOUT
-                          net.Dial timeout to the backend, default is 5 seconds
-  DEMARKATE_CERT_FILES    Comma separated list of PEM, CRT or KEY files. It will
+                          net.Dial timeout to the backend, default is 5
+                          seconds.
+  DEMARKATE_CERT_FILES    Comma separated list of PEM, CRT or KEY files. Will
                           try to load both certificate and private key from
                           each file (you can combine cert and key into a single
                           pem file or keep them in separate files)
@@ -378,7 +624,7 @@ consumed by e.g fluentd).
 
 
 func Start(cnf *Config) error {
-  var shrpf SingleHostReverseProxyFunc
+  var proxy *httputil.ReverseProxy
   h2typeString := "http2c (cleartext!)"
   if len(cnf.CertFiles) > 0 {
     h2typeString = "http2 (tls)"
@@ -390,30 +636,40 @@ func Start(cnf *Config) error {
 
   // initial assertions
   errors := []error{}
-  switch strings.ToLower(cnf.BackendType) {
-    case "h2c", "http2c":
-      shrpf = NewSingleHostH2cReverseProxy
-    case "http2":
-      shrpf = NewSingleHostH2ReverseProxy
-    case "http", "http1":
-      shrpf = NewSingleHostHTTPReverseProxy
-    default:
-      errors = append(errors, fmt.Errorf(`DEMARKATE_BACKEND_TYPE "%s" is unknown`, cnf.BackendType))
-  }
-  if cnf.ListenTo == "" {
+  if len(cnf.ListenTo) == 0 {
     errors = append(errors, fmt.Errorf(`missing listen address, e.g: DEMARKATE_LISTEN_TO=":8080" %s`, os.Args[0]))
   }
-  if cnf.Backend == "" {
-    errors = append(errors, fmt.Errorf("missing backend URL, hint: environment variable DEMARKATE_BACKEND"))
+
+  if len(cnf.Backends) > 0 {
+    if cnf.Backend != "" {
+      errors = append(errors, fmt.Errorf("you can not use both DEMARKATE_BACKEND and DEMARKATE_BACKENDS, choose one, BACKEND for single host reverse proxy or BACKENDS for multiple backends"))
+    }
+  } else {
+    if cnf.Backend == "" {
+      errors = append(errors, fmt.Errorf("missing backend URL, hint: environment variable DEMARKATE_BACKEND"))
+    } else {
+      backend_url, err := url.Parse(cnf.Backend)
+      if err != nil {
+        errors = append(errors, err)
+      } else {
+        cnf.BackendStructs = append(cnf.BackendStructs, BackendStruct{
+          Filter: "/",
+          Target: cnf.Backend,
+          URL: backend_url,
+        })
+      }
+    }
   }
-  backend_url, err := url.Parse(cnf.Backend)
-  if err != nil {
-    errors = append(errors, err)
+
+  proxy = NewReverseProxy(cnf)
+  if proxy == nil {
+    errors = append(errors, fmt.Errorf("could not create new reverse proxy, unknown backend type?"))
   }
+
   if cnf.UsageOnSyntaxError && len(errors) > 0 {
     Usage()
-    return fmt.Errorf("Syntax error")
-  } else if len(errors) > 0 {
+  }
+  if len(errors) > 0 {
     for i, err := range errors {
       log.Error(err.Error())
       if i == len(errors) - 1 {
@@ -427,11 +683,14 @@ func Start(cnf *Config) error {
       EnvconfigPrefix + "_PROTOCOL": cnf.Protocol,
       EnvconfigPrefix + "_LISTEN_TO": cnf.ListenTo,
       EnvconfigPrefix + "_MAX_CONNS": cnf.MaxConns,
+      EnvconfigPrefix + "_MAX_IDLE_CONNS": cnf.MaxIdleConns,
+      EnvconfigPrefix + "_TIMEOUT": cnf.Timeout.String(),
       EnvconfigPrefix + "_READHEADERTIMEOUT": cnf.ReadHeaderTimeout.String(),
       EnvconfigPrefix + "_READTIMEOUT": cnf.ReadTimeout.String(),
       EnvconfigPrefix + "_WRITETIMEOUT": cnf.WriteTimeout.String(),
       EnvconfigPrefix + "_IDLETIMEOUT": cnf.IdleTimeout.String(),
       EnvconfigPrefix + "_BACKEND": cnf.Backend,
+      EnvconfigPrefix + "_BACKENDS": cnf.Backends,
       EnvconfigPrefix + "_BACKEND_TYPE": cnf.BackendType,
       EnvconfigPrefix + "_BACKEND_TIMEOUT": cnf.BackendTimeout.String(),
       EnvconfigPrefix + "_CERT_FILES": cnf.CertFiles,
@@ -442,11 +701,6 @@ func Start(cnf *Config) error {
       "version": version,
   })
   startlog.Info("Initializing demarkate")
-
-  // Create a net.Dialer with Timeout set to DEMARKATE_BACKEND_TIMEOUT
-  netDialer = net.Dialer{ Timeout: cnf.BackendTimeout }
-
-  proxy := shrpf(backend_url)
 
   /** tlsConfig from https://gist.github.com/denji/12b3a568f092ab951456
     */
@@ -470,17 +724,18 @@ func Start(cnf *Config) error {
     },
   }
 
-  handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+  handler := custom.TimeoutHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
     log.WithFields(log.Fields{
       "file": "access.log",
       "remote_addr": r.RemoteAddr,
       "method": r.Method,
       "request_uri": r.RequestURI,
-      "proto": r.Proto,
+      "protocol": r.Proto,
+      "close": r.Close,
       "content_length": r.ContentLength,
     }).Infof("%s DE %s", r.RequestURI, r.RemoteAddr)
     proxy.ServeHTTP(w, r)
-  })
+  }), cnf.Timeout, "")
 
   srv := &http.Server{
     ReadHeaderTimeout: cnf.ReadHeaderTimeout,
@@ -492,17 +747,30 @@ func Start(cnf *Config) error {
     ErrorLog: logWrapper,
   }
 
-  log.Info(fmt.Sprintf("Starting demarkate %s proxy on address %s (%s) for backend %s", h2typeString, cnf.ListenTo, cnf.Protocol, cnf.Backend))
+  log.Info(fmt.Sprintf("Starting demarkate %s proxy on address %s (%s)", h2typeString, strings.Join(cnf.ListenTo, ", "), cnf.Protocol))
 
-  lis, err := net.Listen(cnf.Protocol, cnf.ListenTo)
+  lis, err := net.Listen(cnf.Protocol, cnf.ListenTo[0])
   if err != nil {
-    log.Error(err.Error())
+    log.Errorf("Can not bind %s: %s", cnf.ListenTo[0], err.Error())
     return err
   }
   defer lis.Close()
-
   // Limit simultaneous connections to DEMARKATE_MAX_CONNS
   lis = netutil.LimitListener(lis, cnf.MaxConns)
+
+  var lis2 net.Listener
+  if len(cnf.ListenTo) == 2 {
+    var err error
+    lis2, err = net.Listen(cnf.Protocol, cnf.ListenTo[1])
+    if err != nil {
+      log.Errorf("Can not bind %s", cnf.ListenTo[1], err.Error())
+      return err
+    }
+    defer lis2.Close()
+    // Limit simultaneous connections to 2nd listener to DEMARKATE_MAX_CONNS
+    // aswell. TODO: Do we need a separate max conns setting?
+    lis2 = netutil.LimitListener(lis2, cnf.MaxConns)
+  }
 
   var cert *tls.Certificate
   if len(cnf.CertFiles) < 1 {
@@ -516,6 +784,10 @@ func Start(cnf *Config) error {
       // Start a H2C server, cleartext HTTP2
       h2srv := &http2.Server{}
       srv.Handler = h2c.NewHandler(handler, h2srv)
+      if len(cnf.ListenTo) == 2 {
+        // start 2nd listener first
+        go srv.Serve(lis2)
+      }
       return srv.Serve(lis)
     }
   } else {
@@ -528,6 +800,13 @@ func Start(cnf *Config) error {
   // add certificate to tls.Config
   tlsConfig.Certificates = []tls.Certificate{ *cert }
 
+  // start 2nd server first, if specified, as a h2c (cleartext) server
+  if len(cnf.ListenTo) == 2 {
+    h2srv := &http2.Server{}
+    srv2 := srv
+    srv2.Handler = h2c.NewHandler(handler, h2srv)
+    go srv2.Serve(lis2)
+  }
   // Start a HTTPS/HTTP2 server
   return srv.ServeTLS(lis, "" ,"")
 }
