@@ -28,6 +28,7 @@ import (
   "io"
   "strings"
   "bytes"
+  "path"
   golog "log"
 
   "golang.org/x/net/http2"
@@ -36,6 +37,8 @@ import (
   log "github.com/sirupsen/logrus"
   "github.com/kelseyhightower/envconfig"
   "github.com/gobwas/glob"
+  "github.com/prometheus/client_golang/prometheus"
+  "github.com/prometheus/client_golang/prometheus/promhttp"
   "github.com/sa6mwa/demarkate/pemloader"
   "github.com/sa6mwa/demarkate/custom"
 )
@@ -45,6 +48,7 @@ var version = "v0.0"
 
 // envconfig prefix
 var EnvconfigPrefix = "DEMARKATE"
+
 
 
 // This is a fake io.Writer for use with log.Logger to logrus. Inspired by
@@ -130,7 +134,9 @@ type Config struct {
   SelfSign bool `envconfig:"SELF_SIGN"`
   Organization string `envconfig:"SELF_SIGN_ORG"`
   CommonName string `envconfig:"SELF_SIGN_CN"`
-  Log bool `envconfig:"LOG"`
+  EnableMetrics bool `envconfig:"ENABLE_METRICS"`
+  Prometheus string `envconfig:"PROMETHEUS"`
+  MetricsPath string `envconfig:"METRICS_PATH"`
   UsageOnSyntaxError bool `envconfig:"USAGE"`
   BackendStructs []BackendStruct `ignored:"true"`
   URL *url.URL `ignored:"true"`
@@ -165,7 +171,9 @@ func New(opts ...Option) Config {
     SelfSign: false,
     Organization: "Globex Corporation",
     CommonName: "localhost",
-    Log: true,
+    EnableMetrics: false,
+    Prometheus: "",
+    MetricsPath: "",
     UsageOnSyntaxError: true,
   }
   for _, opt := range opts {
@@ -194,6 +202,15 @@ func New(opts ...Option) Config {
   // second is always h2c or http1 with h2c upgrade (unencrypted)
   if len(cnf.ListenTo) > 2 {
     cnf.ListenTo = cnf.ListenTo[:2]
+  }
+  // if EnableMetrics is true, override empty defaults with true defaults
+  if cnf.EnableMetrics {
+    if cnf.Prometheus == "" {
+      cnf.Prometheus = "127.0.0.1:9090"
+    }
+    if cnf.MetricsPath == "" {
+      cnf.MetricsPath = "/metrics"
+    }
   }
   return *cnf
 }
@@ -299,9 +316,6 @@ func Panic(format string, v ...interface{}) {
 }
 
 
-// Used to store the signature of which NewSingleHostReverseProxy function to
-// use depending on the value of DEMARKATE_BACKEND_TYPE.
-//type SingleHostReverseProxyFunc func(*url.URL)(*httputil.ReverseProxy)
 
 
 func isOneOf(s string, mustBeOneOf... string) error {
@@ -388,10 +402,17 @@ func NewReverseProxy(cnf *Config) (*httputil.ReverseProxy) {
         // explicitly disable User-Agent so it's not set to default value
         req.Header.Set("User-Agent", "")
       }
+
+      from := req.RemoteAddr
+      forwardedFor := req.Header.Get("X-Forwarded-For")
+      if forwardedFor != "" {
+        from = forwardedFor
+      }
       log.WithFields(log.Fields{
         "request_uri": req.RequestURI,
         "host": req.Host,
         "remote_addr": req.RemoteAddr,
+        "x_forwarded_for": forwardedFor,
         "method": req.Method,
         "protocol": req.Proto,
         "close": req.Close,
@@ -399,7 +420,7 @@ func NewReverseProxy(cnf *Config) (*httputil.ReverseProxy) {
         "filter": b.Filter,
         "backend": b.Target,
         "user-agent": req.Header.Get("User-Agent"),
-      }).Infof("%s%s DE %s QSO %s://%s%s", req.Host, origURLpath, req.RemoteAddr, req.URL.Scheme, req.URL.Host, req.URL.Path)
+      }).Infof("%s%s DE %s QSO %s://%s%s", req.Host, origURLpath, from, req.URL.Scheme, req.URL.Host, req.URL.Path)
     }
   } else {
     // else it's a multi-host, multi-path director
@@ -447,10 +468,17 @@ func NewReverseProxy(cnf *Config) (*httputil.ReverseProxy) {
             // explicitly disable User-Agent so it's not set to default value
             req.Header.Set("User-Agent", "")
           }
+
+          from := req.RemoteAddr
+          forwardedFor := req.Header.Get("X-Forwarded-For")
+          if forwardedFor != "" {
+            from = forwardedFor
+          }
           log.WithFields(log.Fields{
             "request_uri": req.RequestURI,
             "host": req.Host,
             "remote_addr": req.RemoteAddr,
+            "x_forwarded_for": forwardedFor,
             "method": req.Method,
             "protocol": req.Proto,
             "close": req.Close,
@@ -458,7 +486,7 @@ func NewReverseProxy(cnf *Config) (*httputil.ReverseProxy) {
             "filter": b.Filter,
             "backend": b.Target,
             "user-agent": req.Header.Get("User-Agent"),
-          }).Infof("%s%s DE %s QSO %s://%s%s", req.Host, origURLpath, req.RemoteAddr, req.URL.Scheme, req.URL.Host, req.URL.Path)
+          }).Infof("%s%s DE %s QSO %s://%s%s", req.Host, origURLpath, from, req.URL.Scheme, req.URL.Host, req.URL.Path)
           return
         }
       }
@@ -613,7 +641,13 @@ consumed by e.g fluentd).
   DEMARKATE_SELF_SIGN_ORG Subject Organization of self-signed certificate
   DEMARKATE_SELF_SIGN_CN  Subject CommonName of self-signed certificate
                           (usually the domain name)
-  DEMARKATE_LOG           Log or not ("true" or "false", default is "true")
+  DEMARKATE_ENABLE_METRICS
+                          Enable Prometheus metrics endpoint (default "false").
+  DEMARKATE_PROMETHEUS    Address to bind and serve prometheus metrics, default
+                          is "127.0.0.1:9090", same format as LISTEN_TO, but
+                          only one address.
+  DEMARKATE_METRICS_PATH  Path where metrics are served, default is "/metrics".
+                          Full default URL is http://127.0.0.1:9090/metrics
   DEMARKATE_USAGE         Print usage on syntax error ("true" by default), will
                           break json logging (set to "false" to disable usage
                           printing)
@@ -697,7 +731,9 @@ func Start(cnf *Config) error {
       EnvconfigPrefix + "_SELF_SIGN": cnf.SelfSign,
       EnvconfigPrefix + "_SELF_SIGN_ORG": cnf.Organization,
       EnvconfigPrefix + "_SELF_SIGN_CN": cnf.CommonName,
-      EnvconfigPrefix + "_LOG": cnf.Log,
+      EnvconfigPrefix + "_ENABLE_METRICS": cnf.EnableMetrics,
+      EnvconfigPrefix + "_PROMETHEUS": cnf.Prometheus,
+      EnvconfigPrefix + "_METRICS_PATH": cnf.MetricsPath,
       "version": version,
   })
   startlog.Info("Initializing demarkate")
@@ -724,18 +760,77 @@ func Start(cnf *Config) error {
     },
   }
 
-  handler := custom.TimeoutHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+  // TODO implement http.FileServer (returns a Handler), should be able to do
+  // both proxy.ServeHTTP(w, r) and
+  // fs := http.StripPrefix("/dir", http.FileServer(http.Dir("./dir"))); fs.ServeHTTP(w, r).
+  demarkate_handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+    from := r.RemoteAddr
+    forwardedFor := r.Header.Get("X-Forwarded-For")
+    if forwardedFor != "" {
+      from = forwardedFor
+    }
     log.WithFields(log.Fields{
       "file": "access.log",
       "remote_addr": r.RemoteAddr,
+      "x_forwarded_for": forwardedFor,
       "method": r.Method,
       "request_uri": r.RequestURI,
       "protocol": r.Proto,
       "close": r.Close,
       "content_length": r.ContentLength,
-    }).Infof("%s DE %s", r.RequestURI, r.RemoteAddr)
+    }).Infof("%s DE %s", r.RequestURI, from)
     proxy.ServeHTTP(w, r)
-  }), cnf.Timeout, "")
+  })
+  demarkate_timeout_handler := custom.TimeoutHandler(demarkate_handler, cnf.Timeout, "")
+  handler := demarkate_timeout_handler
+
+  if cnf.EnableMetrics {
+    inFlightGauge := prometheus.NewGauge(prometheus.GaugeOpts{
+      Name: "demarkate_in_flight_requests",
+      Help: "A gauge of requests currently being served by Demarkate.",
+    })
+    counter := prometheus.NewCounterVec(
+      prometheus.CounterOpts{
+        Name: "demarkate_requests_total",
+        Help: "A counter for requests through Demarkate.",
+      },
+      []string{"code", "method"},
+    )
+    duration := prometheus.NewHistogramVec(
+      prometheus.HistogramOpts{
+        Name: "demarkate_request_duration_seconds",
+        Help: "A histogram of latencies for requests.",
+        Buckets: []float64{.25, .5, 1, 2.5, 5, 10},
+      },
+      []string{"handler", "method"},
+      //[]string{"code", "method"},
+    )
+    responseSize := prometheus.NewHistogramVec(
+      prometheus.HistogramOpts{
+        Name: "demarkate_response_size_bytes",
+        Help: "A histogram of response sizes for requests.",
+        Buckets: []float64{200, 500, 900, 1500},
+      },
+      []string{},
+    )
+    prometheus.MustRegister(inFlightGauge, counter, duration, responseSize)
+    handler = promhttp.InstrumentHandlerInFlight(inFlightGauge,
+      promhttp.InstrumentHandlerDuration(duration.MustCurryWith(prometheus.Labels{"handler": "demarkate"}),
+        promhttp.InstrumentHandlerCounter(counter,
+          promhttp.InstrumentHandlerResponseSize(responseSize, demarkate_timeout_handler),
+        ),
+      ),
+    )
+    sm := http.NewServeMux()
+    cleanMetricsPath := path.Clean(cnf.MetricsPath)
+    sm.Handle(cleanMetricsPath, promhttp.Handler())
+    l, err := net.Listen(cnf.Protocol, cnf.Prometheus)
+    if err != nil {
+      log.Error(err.Error())
+      return err
+    }
+    go http.Serve(l, sm)
+  }
 
   srv := &http.Server{
     ReadHeaderTimeout: cnf.ReadHeaderTimeout,
